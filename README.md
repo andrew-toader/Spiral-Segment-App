@@ -1,2 +1,2 @@
-# SpiralAnalysis
-Analysis of drawn spirals to detect tremor
+# Spiral Segment App
+Segment scanned paper drawn spirals to facilitate their analysis in tremor detection.
