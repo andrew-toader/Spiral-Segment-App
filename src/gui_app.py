@@ -76,6 +76,7 @@ Per-image workflow:
 Run with:  python gui_app.py
 """
 
+import glob
 import os
 import pickle
 import sys
@@ -91,23 +92,31 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QRadioButton,
+    QTableWidget,
+    QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 import core
+import spiral_analysis
 
 
 LABEL_COLORS = {
@@ -493,6 +502,167 @@ class SplitSegmentDialog(QDialog):
 
 
 # ==========================================================================
+# Unraveled spiral (X/Y) dialog -- shows the ordered spiral coordinate
+# trace for every trial of a patient side by side, so how it changes
+# (smooths out / becomes more regular) across trials is directly visible.
+# ==========================================================================
+
+def _grid_dims(n):
+    """Roughly-square (rows, cols) layout for n subplots."""
+    n = max(n, 1)
+    ncols = int(np.ceil(np.sqrt(n)))
+    nrows = int(np.ceil(n / ncols))
+    return nrows, ncols
+
+
+def _break_line_at_jumps(pts, factor=4.0):
+    """Returns (rows, cols) arrays for ax.plot(), with a NaN inserted
+    wherever a step between consecutive ordered points is unusually
+    large (more than `factor` times the median step size). The greedy
+    walk in order_pts_center sometimes exhausts every nearby point and
+    has to jump to whatever remains, which can be far away -- plotted
+    plainly, that draws a long spurious line straight across the trace
+    (including what can look like the last point connecting back to the
+    first, or to some other unrelated point). Breaking the line at those
+    jumps instead of drawing through them fixes that."""
+    if len(pts) < 3:
+        return pts[:, 0].astype(float).copy(), pts[:, 1].astype(float).copy()
+    diffs = np.hypot(np.diff(pts[:, 0]), np.diff(pts[:, 1]))
+    median_step = np.median(diffs)
+    threshold = max(factor * median_step, 5.0)
+    rows = pts[:, 0].astype(float)
+    cols = pts[:, 1].astype(float)
+    jump_idx = np.where(diffs > threshold)[0]
+    rows = np.insert(rows, jump_idx + 1, np.nan)
+    cols = np.insert(cols, jump_idx + 1, np.nan)
+    return rows, cols
+
+
+def populate_unraveled_spiral_figure(fig, patient_name, result):
+    """Fills `fig` with one square subplot per trial, showing that
+    trial's ordered spiral walk (order_pts_center) as separate X (col)
+    and Y (row) traces against position along the walk. Shared by the
+    interactive dialog and the auto-saved PNG so both always match."""
+    n_trials = len(result["import_order"])
+    nrows, ncols = _grid_dims(n_trials)
+    for i, trial_name in enumerate(result["import_order"]):
+        ax = fig.add_subplot(nrows, ncols, i + 1)
+        pts = result["per_trial"][i]["pts_spiral_ordered"]
+        rows, cols = _break_line_at_jumps(pts)
+        idx = np.arange(len(rows))
+        ax.plot(idx, cols, label="X (col)", color="tab:blue", linewidth=0.8)
+        ax.plot(idx, rows, label="Y (row)", color="tab:orange", linewidth=0.8)
+
+        is_baseline = (i == result["baseline_index"])
+        if is_baseline:
+            title = f"{patient_name} - {trial_name} (baseline)"
+        else:
+            pct = result["improvement_spiral"][i] * 100
+            title = f"{trial_name}  {pct:+.1f}%"
+        ax.set_title(title, fontsize=8)
+        ax.legend(fontsize=6, loc="upper right")
+        ax.tick_params(labelsize=6)
+        ax.set_xlabel("Position along unraveled spiral", fontsize=7)
+        ax.set_box_aspect(1)
+    fig.tight_layout()
+
+
+def populate_spiral_image_figure(fig, patient_name, result):
+    """Fills `fig` with one square subplot per trial: just the spiral
+    (dark blue), as a connected line through its ordered points
+    (order_pts_center) -- no template, not a raster image, not the
+    derived unravel-distance metric. Shared by the interactive dialog
+    and the auto-saved PNG."""
+    n_trials = len(result["import_order"])
+    nrows, ncols = _grid_dims(n_trials)
+    for i, trial_name in enumerate(result["import_order"]):
+        ax = fig.add_subplot(nrows, ncols, i + 1)
+        spiral_pts = result["per_trial"][i]["pts_spiral_ordered"]
+        rows, cols = _break_line_at_jumps(spiral_pts)
+        ax.plot(cols, rows, "-", color="darkblue", linewidth=1)
+        ax.set_aspect("equal")
+        ax.invert_yaxis()  # row 0 at top, matching image orientation
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+        is_baseline = (i == result["baseline_index"])
+        if is_baseline:
+            title = f"{patient_name} - {trial_name} (baseline)"
+        else:
+            pct = result["improvement_spiral"][i] * 100
+            title = f"{trial_name}  {pct:+.1f}%"
+        ax.set_title(title, fontsize=8)
+    fig.tight_layout()
+
+
+class UnraveledSpiralDialog(QDialog):
+    def __init__(self, parent, patient_name, result):
+        super().__init__(parent)
+        self.setWindowTitle(f"Unraveled Spiral -- {patient_name}")
+        n_trials = len(result["import_order"])
+        nrows, ncols = _grid_dims(n_trials)
+        self.resize(min(1200, 320 * ncols + 100), min(950, 300 * nrows + 160))
+
+        layout = QVBoxLayout(self)
+        help_label = QLabel(
+            "Each panel is one trial's spiral, unraveled into its ordered "
+            "walk from center outward (see order_pts_center) -- X (column) "
+            "and Y (row) plotted separately against position along that "
+            "walk. A steadier, less jagged trace generally corresponds to "
+            "a better (more negative) percent-change score."
+        )
+        help_label.setWordWrap(True)
+        help_label.setStyleSheet("color: #666; font-size: 11px;")
+        layout.addWidget(help_label)
+
+        fig = Figure(figsize=(3.2 * ncols, 3.0 * nrows))
+        canvas = FigureCanvasQTAgg(fig)
+        toolbar = NavigationToolbar2QT(canvas, self)
+        layout.addWidget(toolbar)
+        layout.addWidget(canvas, stretch=1)
+        populate_unraveled_spiral_figure(fig, patient_name, result)
+        canvas.draw()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.accept)
+        buttons.button(QDialogButtonBox.Close).clicked.connect(self.accept)
+        layout.addWidget(buttons)
+
+
+class SpiralImageDialog(QDialog):
+    def __init__(self, parent, patient_name, result):
+        super().__init__(parent)
+        self.setWindowTitle(f"Spiral Images -- {patient_name}")
+        n_trials = len(result["import_order"])
+        nrows, ncols = _grid_dims(n_trials)
+        self.resize(min(1200, 320 * ncols + 100), min(950, 320 * nrows + 160))
+
+        layout = QVBoxLayout(self)
+        help_label = QLabel(
+            "Each panel shows that trial's actual drawn spiral (dark "
+            "blue) as a connected line through its traced points."
+        )
+        help_label.setWordWrap(True)
+        help_label.setStyleSheet("color: #666; font-size: 11px;")
+        layout.addWidget(help_label)
+
+        fig = Figure(figsize=(3.2 * ncols, 3.2 * nrows))
+        canvas = FigureCanvasQTAgg(fig)
+        toolbar = NavigationToolbar2QT(canvas, self)
+        layout.addWidget(toolbar)
+        layout.addWidget(canvas, stretch=1)
+        populate_spiral_image_figure(fig, patient_name, result)
+        canvas.draw()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.accept)
+        buttons.button(QDialogButtonBox.Close).clicked.connect(self.accept)
+        layout.addWidget(buttons)
+
+
+# ==========================================================================
 # Main window
 # ==========================================================================
 
@@ -551,9 +721,12 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------------- UI --
 
     def _build_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        root_layout = QHBoxLayout(central)
+        self.tabs = QTabWidget()
+        self.setCentralWidget(self.tabs)
+
+        segment_tab = QWidget()
+        self.tabs.addTab(segment_tab, "Segment")
+        root_layout = QHBoxLayout(segment_tab)
 
         # --- Sidebar ---
         sidebar = QVBoxLayout()
@@ -729,6 +902,608 @@ class MainWindow(QMainWindow):
         outer.addLayout(cancel_edit_row)
 
         self._set_controls_enabled(False)
+
+        self._build_analyze_tab()
+
+    # ------------------------------------------------------------ Analyze tab --
+
+    def _build_analyze_tab(self):
+        """Pick a folder containing patient subfolders (any of which may
+        hold a "*_spiral.pkl"), list the patients found, choose an
+        analysis mode (all trials vs. one baseline, or a simple pre/post
+        comparison of exactly 2 trials), pick each patient's trial(s)
+        for that mode, then run the full spiral_analysis pipeline across
+        all of them. Every "Analyze All" run automatically saves its
+        results (CSVs + PNGs) into a timestamped folder -- see
+        _auto_save_analysis."""
+        tab = QWidget()
+        self.tabs.addTab(tab, "Analyze")
+        layout = QVBoxLayout(tab)
+
+        top_row = QHBoxLayout()
+        self.btn_choose_data_folder = QPushButton("Choose Data Folder...")
+        self.btn_choose_data_folder.clicked.connect(self._choose_data_folder)
+        top_row.addWidget(self.btn_choose_data_folder)
+        self.data_folder_label = QLabel("No folder selected.")
+        self.data_folder_label.setWordWrap(True)
+        top_row.addWidget(self.data_folder_label, stretch=1)
+        layout.addLayout(top_row)
+
+        help_label = QLabel(
+            "Select any folder containing patient subfolders. Any "
+            "subfolder with a '*_spiral.pkl' file in it shows up below "
+            "as a patient."
+        )
+        help_label.setWordWrap(True)
+        help_label.setStyleSheet("color: #666; font-size: 11px;")
+        layout.addWidget(help_label)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Analysis mode:"))
+        self.analysis_mode_combo = QComboBox()
+        self.analysis_mode_combo.addItems([
+            "All trials vs. baseline", "Pre/Post (2 trials)",
+        ])
+        self.analysis_mode_combo.currentIndexChanged.connect(self._on_analysis_mode_changed)
+        mode_row.addWidget(self.analysis_mode_combo)
+        mode_row.addStretch(1)
+        layout.addLayout(mode_row)
+
+        self.patient_table = QTableWidget(0, 4)
+        self.patient_table.verticalHeader().setVisible(False)
+        self.patient_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.patient_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.patient_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.patient_table.itemSelectionChanged.connect(self._on_patient_row_selected)
+        layout.addWidget(self.patient_table, stretch=1)
+
+        btn_row = QHBoxLayout()
+        self.btn_analyze_all = QPushButton("Analyze All")
+        self.btn_analyze_all.clicked.connect(self._run_analysis_all)
+        self.btn_analyze_all.setEnabled(False)
+        self.btn_analyze_all.setStyleSheet(
+            "QPushButton { background-color: #1565C0; color: white; "
+            "font-weight: bold; padding: 6px 14px; border-radius: 4px; } "
+            "QPushButton:disabled { background-color: #90A4C7; color: #E0E0E0; }"
+        )
+        btn_row.addWidget(self.btn_analyze_all)
+        layout.addLayout(btn_row)
+
+        display_row = QHBoxLayout()
+        self.btn_show_combined_graph = QPushButton("All Patients Pre vs. Post Graph")
+        self.btn_show_combined_graph.clicked.connect(self._show_combined_summary_graph)
+        self.btn_show_combined_graph.setEnabled(False)
+        display_row.addWidget(self.btn_show_combined_graph)
+
+        self.btn_show_unraveled = QPushButton("Show Unraveled Spiral")
+        self.btn_show_unraveled.clicked.connect(self._show_unraveled_spiral_dialog)
+        self.btn_show_unraveled.setEnabled(False)
+        display_row.addWidget(self.btn_show_unraveled)
+
+        self.btn_show_spiral_image = QPushButton("Show Spiral Image")
+        self.btn_show_spiral_image.clicked.connect(self._show_spiral_image_dialog)
+        self.btn_show_spiral_image.setEnabled(False)
+        display_row.addWidget(self.btn_show_spiral_image)
+        layout.addLayout(display_row)
+
+        self.analyze_progress = QProgressBar()
+        self.analyze_progress.setVisible(False)
+        layout.addWidget(self.analyze_progress)
+
+        self.analyze_log = QPlainTextEdit()
+        self.analyze_log.setReadOnly(True)
+        self.analyze_log.setMaximumHeight(110)
+        layout.addWidget(self.analyze_log)
+
+        # Shows either the selected patient's improvement_spiral line
+        # (matching the original script's Figure 8) or, after "All
+        # Patients Pre vs. Post Graph", a bar chart comparing every
+        # analyzed patient's headline result.
+        self.analyze_fig = Figure(figsize=(9, 3.2))
+        self.analyze_canvas = FigureCanvasQTAgg(self.analyze_fig)
+        self.analyze_ax = self.analyze_fig.add_subplot(111)
+        layout.addWidget(self.analyze_canvas)
+
+        # --- Analyze-tab state ---
+        self.data_folder = None
+        self.patients = {}          # patient name -> {"pkl_path", "state" (lazy), "import_order"}
+        self.analysis_results = {}  # patient name -> analyze_patient() result dict, or None
+        self.analysis_errors = {}   # patient name -> error message string
+        self.analysis_mode = "baseline"  # "baseline" or "prepost"
+        self._selected_patient_name = None
+
+        self._rebuild_patient_table()  # sets up column headers for the default mode
+
+    def _on_analysis_mode_changed(self, index):
+        self.analysis_mode = "baseline" if index == 0 else "prepost"
+        self._rebuild_patient_table()
+
+    def _log_analyze(self, msg):
+        self.analyze_log.appendPlainText(msg)
+        QApplication.processEvents()
+
+    def _choose_data_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select data folder (containing patient subfolders)"
+        )
+        if not folder:
+            return
+        self.data_folder = folder
+        self.data_folder_label.setText(f"Data folder: {folder}")
+        self._scan_for_patients()
+        self._check_for_previous_analysis()
+
+    def _scan_for_patients(self):
+        self.patients = {}
+        self.analysis_results = {}
+        self.analysis_errors = {}
+
+        try:
+            subfolders = sorted(
+                d for d in os.listdir(self.data_folder)
+                if os.path.isdir(os.path.join(self.data_folder, d))
+            )
+        except OSError as e:
+            QMessageBox.warning(self, "Couldn't read folder", str(e))
+            return
+
+        for name in subfolders:
+            if name == "analysis":
+                continue  # this is where auto-saved results live, not a patient
+            sub_path = os.path.join(self.data_folder, name)
+            matches = sorted(glob.glob(os.path.join(sub_path, "*_spiral.pkl")))
+            if not matches:
+                continue
+            pkl_path = matches[0]
+            try:
+                with open(pkl_path, "rb") as f:
+                    state = pickle.load(f)
+                import_order = state.get("import_order", [])
+            except Exception as e:
+                self.patients[name] = {"pkl_path": pkl_path, "state": None, "import_order": []}
+                self.analysis_errors[name] = f"Couldn't load: {e}"
+                continue
+            self.patients[name] = {"pkl_path": pkl_path, "state": state, "import_order": import_order}
+
+        self._rebuild_patient_table()
+        self.btn_analyze_all.setEnabled(len(self.patients) > 0)
+        if not self.patients:
+            self._log_analyze(
+                f"No patient subfolders with a '*_spiral.pkl' file were "
+                f"found directly inside {self.data_folder}."
+            )
+        else:
+            self._log_analyze(f"Found {len(self.patients)} patient(s).")
+
+    def _check_for_previous_analysis(self):
+        """If this data folder already has an 'analysis' subfolder with
+        one or more previous timestamped runs, ask whether to load one
+        (letting the person pick which) or start a new analysis."""
+        analysis_root = os.path.join(self.data_folder, "analysis")
+        if not os.path.isdir(analysis_root):
+            return
+        try:
+            runs = sorted(
+                d for d in os.listdir(analysis_root)
+                if os.path.isdir(os.path.join(analysis_root, d))
+                and os.path.exists(os.path.join(analysis_root, d, "analysis_results.pkl"))
+            )
+        except OSError:
+            return
+        if not runs:
+            return
+
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("Previous analysis found")
+        msg_box.setText(
+            f"{len(runs)} previous analysis folders found. Load previous "
+            f"or start new analysis?"
+        )
+        load_btn = msg_box.addButton("Load Previous", QMessageBox.YesRole)
+        msg_box.addButton("Start New Analysis", QMessageBox.NoRole)
+        msg_box.setDefaultButton(load_btn)
+        msg_box.exec_()
+        if msg_box.clickedButton() != load_btn:
+            return
+
+        selected, ok = QInputDialog.getItem(
+            self, "Select analysis to load", "Analysis run:",
+            runs, current=len(runs) - 1, editable=False,
+        )
+        if not ok or not selected:
+            return
+        self._load_previous_analysis(os.path.join(analysis_root, selected))
+
+    def _load_previous_analysis(self, run_dir):
+        pkl_path = os.path.join(run_dir, "analysis_results.pkl")
+        try:
+            with open(pkl_path, "rb") as f:
+                saved = pickle.load(f)
+        except Exception as e:
+            QMessageBox.warning(self, "Couldn't load previous analysis", str(e))
+            return
+
+        self.analysis_mode = saved["analysis_mode"]
+        self.analysis_mode_combo.blockSignals(True)
+        self.analysis_mode_combo.setCurrentIndex(0 if self.analysis_mode == "baseline" else 1)
+        self.analysis_mode_combo.blockSignals(False)
+        self.analysis_results = saved["analysis_results"]
+
+        self._rebuild_patient_table()
+        any_ok = any(r is not None for r in self.analysis_results.values())
+        self.btn_show_combined_graph.setEnabled(any_ok)
+        self._log_analyze(f"Loaded previous analysis from {run_dir}")
+
+    def _rebuild_patient_table(self):
+        """Column layout depends on the analysis mode: baseline mode has
+        one "Baseline trial" dropdown per row; pre/post mode has two
+        ("Pre trial" / "Post trial", defaulting to the first and last
+        trial respectively). Status is always the last column.
+
+        Fully clears the table first -- switching column counts between
+        modes without this leaves orphaned cell widgets (e.g. an old
+        "Post trial" combo box) sitting at whatever position a new
+        column now occupies, rendering on top of the new content."""
+        self.patient_table.clearContents()
+        self.patient_table.setRowCount(0)
+
+        if self.analysis_mode == "baseline":
+            headers = ["Patient", "Trials", "Baseline trial", "Status"]
+        else:
+            headers = ["Patient", "Trials", "Pre trial", "Post trial", "Status"]
+        self._status_col = len(headers) - 1
+
+        self.patient_table.setColumnCount(len(headers))
+        self.patient_table.setHorizontalHeaderLabels(headers)
+        self.patient_table.setRowCount(len(self.patients))
+
+        for row, (name, info) in enumerate(sorted(self.patients.items())):
+            name_item = QTableWidgetItem(name)
+            name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
+            self.patient_table.setItem(row, 0, name_item)
+
+            trials_item = QTableWidgetItem(str(len(info["import_order"])))
+            trials_item.setFlags(trials_item.flags() & ~Qt.ItemIsEditable)
+            self.patient_table.setItem(row, 1, trials_item)
+
+            if self.analysis_mode == "baseline":
+                combo = QComboBox()
+                combo.addItems(info["import_order"])
+                if info["import_order"]:
+                    combo.setCurrentIndex(0)  # default to the first trial
+                self.patient_table.setCellWidget(row, 2, combo)
+            else:
+                pre_combo = QComboBox()
+                post_combo = QComboBox()
+                pre_combo.addItems(info["import_order"])
+                post_combo.addItems(info["import_order"])
+                if info["import_order"]:
+                    pre_combo.setCurrentIndex(0)                       # default: first trial
+                    post_combo.setCurrentIndex(len(info["import_order"]) - 1)  # default: last trial
+                self.patient_table.setCellWidget(row, 2, pre_combo)
+                self.patient_table.setCellWidget(row, 3, post_combo)
+
+            if name in self.analysis_results:
+                status = "done" if self.analysis_results[name] is not None else "error"
+            else:
+                status = self.analysis_errors.get(name, "pending" if info["state"] is not None else "error")
+            status_item = QTableWidgetItem(status)
+            status_item.setFlags(status_item.flags() & ~Qt.ItemIsEditable)
+            self.patient_table.setItem(row, self._status_col, status_item)
+
+        self.patient_table.resizeColumnsToContents()
+        self.patient_table.horizontalHeader().setStretchLastSection(True)
+
+    def _trial_selection_for_row(self, row):
+        """Returns (trial_indices, baseline_index) for analyze_patient,
+        matching the current mode's dropdown(s) on this row."""
+        if self.analysis_mode == "baseline":
+            combo = self.patient_table.cellWidget(row, 2)
+            baseline_index = combo.currentIndex() if combo is not None else 0
+            return None, baseline_index
+        else:
+            pre_combo = self.patient_table.cellWidget(row, 2)
+            post_combo = self.patient_table.cellWidget(row, 3)
+            pre_idx = pre_combo.currentIndex() if pre_combo is not None else 0
+            post_idx = post_combo.currentIndex() if post_combo is not None else 0
+            return [pre_idx, post_idx], 0
+
+    def _run_analysis_all(self):
+        names = sorted(self.patients.keys())
+        n = len(names)
+        self.analyze_progress.setVisible(True)
+        self.analyze_progress.setMaximum(n)
+        self.analyze_progress.setValue(0)
+        self.btn_analyze_all.setEnabled(False)
+
+        for row, name in enumerate(names):
+            info = self.patients[name]
+            self._log_analyze(f"Analyzing {name} ({row + 1}/{n})...")
+            if info["state"] is None:
+                self._log_analyze(f"  skipped -- {self.analysis_errors.get(name, 'failed to load')}")
+                self._set_status_cell(row, "error")
+                self.analysis_results[name] = None
+                self.analyze_progress.setValue(row + 1)
+                continue
+
+            trial_indices, baseline_index = self._trial_selection_for_row(row)
+            if self.analysis_mode == "prepost" and trial_indices[0] == trial_indices[1]:
+                self._log_analyze(f"  skipped -- Pre and Post trials must be different")
+                self._set_status_cell(row, "error")
+                self.analysis_results[name] = None
+                self.analyze_progress.setValue(row + 1)
+                continue
+
+            try:
+                result = spiral_analysis.analyze_patient(
+                    info["state"], baseline_index=baseline_index, trial_indices=trial_indices,
+                )
+                self.analysis_results[name] = result
+                self._set_status_cell(row, "done")
+                self._log_analyze(f"  done -- baseline: {result['import_order'][baseline_index]}")
+            except Exception as e:
+                self.analysis_results[name] = None
+                self.analysis_errors[name] = str(e)
+                self._set_status_cell(row, "error")
+                self._log_analyze(f"  FAILED: {e}")
+
+            self.analyze_progress.setValue(row + 1)
+
+        self.btn_analyze_all.setEnabled(True)
+        any_ok = any(r is not None for r in self.analysis_results.values())
+        self.btn_show_combined_graph.setEnabled(any_ok)
+        self._log_analyze("Analysis complete.")
+
+        if any_ok:
+            self._auto_save_analysis()
+
+    def _set_status_cell(self, row, status):
+        item = self.patient_table.item(row, self._status_col)
+        if item is not None:
+            item.setText(status)
+
+    def _populate_improvement_ax(self, ax, name, result):
+        """Per-patient improvement_spiral line, with each point's
+        percent value labeled directly on the plot. Shared by the
+        interactive canvas and the auto-saved PNG."""
+        pct = result["improvement_spiral"] * 100
+        x = np.arange(len(pct))
+        ax.plot(x, pct, "-s", color="#7B2D8E")
+        for xi, yi in zip(x, pct):
+            ax.annotate(
+                f"{yi:+.1f}%", (xi, yi), textcoords="offset points",
+                xytext=(0, 9), ha="center", fontsize=8, color="#4A1A5C",
+            )
+        ax.axhline(0, color="gray", linewidth=0.8)
+        ax.set_xticks(x)
+        ax.set_xticklabels(result["import_order"], rotation=45, ha="right")
+        ax.set_ylabel("Percent change (%)")
+        ax.set_title(f"{name} -- Spiral-Extracted Improvement")
+        ax.margins(y=0.25)  # headroom so the % labels don't get clipped
+        ax.grid(True, alpha=0.3)
+
+    def _on_patient_row_selected(self):
+        rows = self.patient_table.selectionModel().selectedRows()
+        if not rows:
+            return
+        row = rows[0].row()
+        name_item = self.patient_table.item(row, 0)
+        if name_item is None:
+            return
+        name = name_item.text()
+        result = self.analysis_results.get(name)
+
+        self.analyze_ax.clear()
+        if result is None:
+            self.analyze_ax.text(
+                0.5, 0.5, "Not analyzed yet (or failed) -- run Analyze All.",
+                ha="center", va="center", transform=self.analyze_ax.transAxes,
+            )
+        else:
+            self._populate_improvement_ax(self.analyze_ax, name, result)
+        self.analyze_fig.tight_layout()
+        self.analyze_canvas.draw_idle()
+
+        self._selected_patient_name = name
+        self.btn_show_unraveled.setEnabled(result is not None)
+        self.btn_show_spiral_image.setEnabled(result is not None)
+
+    def _show_unraveled_spiral_dialog(self):
+        name = self._selected_patient_name
+        if name is None:
+            return
+        result = self.analysis_results.get(name)
+        if result is None:
+            return
+        dlg = UnraveledSpiralDialog(self, name, result)
+        dlg.exec_()
+
+    def _show_spiral_image_dialog(self):
+        name = self._selected_patient_name
+        if name is None:
+            return
+        result = self.analysis_results.get(name)
+        if result is None:
+            return
+        dlg = SpiralImageDialog(self, name, result)
+        dlg.exec_()
+
+    def _headline_value(self, result):
+        """The single summary number for a patient's analysis: the
+        improvement_spiral of the LAST trial included in that analysis
+        relative to its baseline. For pre/post mode (exactly 2 trials)
+        this is simply the post-vs-pre result; for baseline mode it's
+        the most recent trial's improvement relative to the chosen
+        baseline."""
+        return float(result["improvement_spiral"][-1]) if result is not None else None
+
+    def _write_complete_data_csv(self, path):
+        """Full per-trial breakdown across every analyzed patient --
+        every computed Welch/AUC feature, not just the headline number."""
+        import csv
+        with open(path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "patient", "trial", "is_baseline", "num_crossings", "num_points",
+                "len_fraction", "auc_spiral", "auc_template", "welch_ratio_auc",
+                "welch_coord_auc", "welch_dist_auc",
+                "welch_coord_auc_comb", "welch_dist_auc_comb",
+                "improvement_welch_coord_combi", "improvement_welch_dist_combi",
+                "improvement_spiral",
+            ])
+            for name, result in sorted(self.analysis_results.items()):
+                if result is None:
+                    continue
+                for i, trial_name in enumerate(result["import_order"]):
+                    t = result["per_trial"][i]
+                    writer.writerow([
+                        name, trial_name, i == result["baseline_index"],
+                        t["num_crossings"], t["num_points"], t["len_fraction"],
+                        t["auc_spiral"], t["auc_template"], t["welch_ratio_auc"],
+                        t["welch_coord_auc"], t["welch_dist_auc"],
+                        result["welch_coord_auc_comb"][i], result["welch_dist_auc_comb"][i],
+                        result["improvement_welch_coord_combi"][i],
+                        result["improvement_welch_dist_combi"][i],
+                        result["improvement_spiral"][i],
+                    ])
+
+    def _write_summary_data_csv(self, path):
+        """Pre/Post mode: one row per patient (patient, mode, baseline
+        trial, comparison trial, headline result).
+
+        Baseline mode: one row per patient, but one COLUMN PER TIMEPOINT
+        (the union of every trial name across all analyzed patients,
+        since different patients can have different trial sets/counts)
+        with that trial's improvement_spiral value, blank where a given
+        patient doesn't have that particular trial."""
+        import csv
+
+        if self.analysis_mode == "prepost":
+            with open(path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["patient", "mode", "baseline_trial", "comparison_trial", "improvement_spiral_pct"])
+                for name, result in sorted(self.analysis_results.items()):
+                    if result is None:
+                        continue
+                    baseline_name = result["import_order"][result["baseline_index"]]
+                    comparison_name = result["import_order"][-1]
+                    writer.writerow([
+                        name, self.analysis_mode, baseline_name, comparison_name,
+                        self._headline_value(result) * 100,
+                    ])
+        else:
+            all_trial_names = []
+            seen = set()
+            for name, result in sorted(self.analysis_results.items()):
+                if result is None:
+                    continue
+                for t in result["import_order"]:
+                    if t not in seen:
+                        seen.add(t)
+                        all_trial_names.append(t)
+
+            with open(path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["patient"] + all_trial_names)
+                for name, result in sorted(self.analysis_results.items()):
+                    if result is None:
+                        continue
+                    row = [name]
+                    for t in all_trial_names:
+                        if t in result["import_order"]:
+                            idx = result["import_order"].index(t)
+                            row.append(result["improvement_spiral"][idx] * 100)
+                        else:
+                            row.append("")
+                    writer.writerow(row)
+
+    def _populate_combined_summary_ax(self, ax):
+        """Bar chart comparing every analyzed patient's headline result
+        (baseline/pre trial vs. last/post trial) side by side. Shared by
+        the interactive canvas and the auto-saved PNG."""
+        names, values = [], []
+        for name, result in sorted(self.analysis_results.items()):
+            if result is None:
+                continue
+            names.append(name)
+            values.append(self._headline_value(result) * 100)
+
+        if not names:
+            ax.text(
+                0.5, 0.5, "No successfully analyzed patients yet.",
+                ha="center", va="center", transform=ax.transAxes,
+            )
+        else:
+            colors = ["#2E8B57" if v <= 0 else "#B22222" for v in values]
+            x = np.arange(len(names))
+            ax.bar(x, values, color=colors)
+            ax.axhline(0, color="gray", linewidth=0.8)
+            ax.set_xticks(x)
+            ax.set_xticklabels(names, rotation=45, ha="right")
+            ax.set_ylabel("Percent change (%)")
+            ax.set_title("All Patients -- Pre vs. Post (Baseline vs. Last Trial)")
+            ax.grid(True, alpha=0.3)
+
+    def _show_combined_summary_graph(self):
+        self.analyze_ax.clear()
+        self._populate_combined_summary_ax(self.analyze_ax)
+        self.analyze_fig.tight_layout()
+        self.analyze_canvas.draw_idle()
+
+    def _auto_save_analysis(self):
+        """Runs automatically at the end of every "Analyze All": writes
+        both CSVs, the combined summary PNG, and (per successfully
+        analyzed patient) the improvement graph, spiral image grid, and
+        unraveled spiral grid -- all into
+        <data_folder>/analysis/<YYYYMMDD_HHMMSS>/. Also pickles the raw
+        results so a later session can load and browse this run without
+        re-running the analysis."""
+        from datetime import datetime
+        run_dir = os.path.join(
+            self.data_folder, "analysis", datetime.now().strftime("%Y%m%d_%H%M%S")
+        )
+        try:
+            os.makedirs(run_dir, exist_ok=True)
+
+            self._write_complete_data_csv(os.path.join(run_dir, "complete_data.csv"))
+            self._write_summary_data_csv(os.path.join(run_dir, "summary_data.csv"))
+
+            combined_fig = Figure(figsize=(9, 5))
+            combined_ax = combined_fig.add_subplot(111)
+            self._populate_combined_summary_ax(combined_ax)
+            combined_fig.tight_layout()
+            combined_fig.savefig(os.path.join(run_dir, "combined_summary.png"), dpi=150, bbox_inches="tight")
+
+            for name, result in self.analysis_results.items():
+                if result is None:
+                    continue
+                patient_dir = os.path.join(run_dir, name)
+                os.makedirs(patient_dir, exist_ok=True)
+
+                imp_fig = Figure(figsize=(7, 4))
+                imp_ax = imp_fig.add_subplot(111)
+                self._populate_improvement_ax(imp_ax, name, result)
+                imp_fig.tight_layout()
+                imp_fig.savefig(os.path.join(patient_dir, "improvement_graph.png"), dpi=150, bbox_inches="tight")
+
+                unravel_fig = Figure()
+                populate_unraveled_spiral_figure(unravel_fig, name, result)
+                unravel_fig.savefig(os.path.join(patient_dir, "unraveled_spiral.png"), dpi=150, bbox_inches="tight")
+
+                spiral_fig = Figure()
+                populate_spiral_image_figure(spiral_fig, name, result)
+                spiral_fig.savefig(os.path.join(patient_dir, "spiral_images.png"), dpi=150, bbox_inches="tight")
+
+            with open(os.path.join(run_dir, "analysis_results.pkl"), "wb") as f:
+                pickle.dump({
+                    "analysis_mode": self.analysis_mode,
+                    "analysis_results": self.analysis_results,
+                }, f)
+
+            self._log_analyze(f"Auto-saved analysis to {run_dir}")
+        except Exception as e:
+            self._log_analyze(f"WARNING: auto-save failed: {e}")
+
 
     def _set_controls_enabled(self, enabled):
         for w in (

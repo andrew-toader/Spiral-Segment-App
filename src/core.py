@@ -521,6 +521,27 @@ def resize_result(arr, output_size):
     )
 
 
+def pad_to_square(mask):
+    """Pad a 2D boolean array with False on the shorter dimension,
+    centered, so it becomes square. Used before resizing to a fixed
+    square output size: resizing a non-square crop directly to a square
+    would stretch it non-uniformly (different scale factor per axis),
+    turning a true circle into an ellipse -- which matters for a
+    downstream radial r(theta) analysis, since that ellipse distortion
+    injects a spurious ~2-cycle-per-revolution component into the
+    signal. Padding first keeps the scale factor uniform in both
+    directions instead.
+    """
+    h, w = mask.shape
+    if h == w:
+        return mask
+    size = max(h, w)
+    pad_h, pad_w = size - h, size - w
+    top, bottom = pad_h // 2, pad_h - pad_h // 2
+    left, right = pad_w // 2, pad_w - pad_w // 2
+    return np.pad(mask, ((top, bottom), (left, right)), mode="constant", constant_values=False)
+
+
 def resize_binary_curve(mask, output_size, dilate_radius=2):
     """Resize a thin (often 1px-wide) binary curve without breaking it up.
 
@@ -532,6 +553,9 @@ def resize_binary_curve(mask, output_size, dilate_radius=2):
     enough width margin to survive blur + thresholding intact, then we
     skeletonize back down to a clean 1px curve at the new resolution.
 
+    Also pads to square before resizing (see pad_to_square) so a
+    non-square source crop doesn't get stretched into an oblong shape.
+
     `mask` should be boolean. Returns a float64 0/1 array.
     """
     thick = dilation(mask, disk(dilate_radius))
@@ -539,8 +563,9 @@ def resize_binary_curve(mask, output_size, dilate_radius=2):
     if output_size == "keep":
         resized_bw = thick
     else:
+        square = pad_to_square(thick)
         resized = resize(
-            thick.astype(np.float64),
+            square.astype(np.float64),
             output_size,
             order=3,
             mode="edge",
